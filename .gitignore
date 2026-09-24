@@ -1,0 +1,33 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+campaign.db
+debug_analytics.db
+campaign_final.db
+*.sqlite3
+debug_*.py
+debug_*.db
+/tests/__pycache__/
+.pytest_cache/
+.vscode/
+.idea/
+.DS_Store
+out/
+*.log
+
+# Python egg
+*.egg-info/
+build/
+dist/
+
+# virtualenv
+env/
+ENV/
+venv/
+
+# macOS
+.DS_Store

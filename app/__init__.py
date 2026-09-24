@@ -1,0 +1,1 @@
+"""Campaign dispatcher application package."""
