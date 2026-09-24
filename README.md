@@ -1,74 +1,154 @@
-﻿# Outbound Voice Campaign Dispatcher
+﻿# 🚀 Outbound Voice Campaign Dispatcher
 
-## 1. Project Title
+Synthetic outbound campaign orchestration in Python using `asyncio`, SQLite, and a deterministic mock telephony layer.
 
-Outbound Voice Campaign Dispatcher
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB) ![asyncio](https://img.shields.io/badge/asyncio-enabled-61DAFB) ![SQLite](https://img.shields.io/badge/SQLite-persistence-003B57) ![pytest](https://img.shields.io/badge/pytest-tested-4A7C59)
 
-## 2. Short Description
+This project implements a small but testable outbound call dispatcher that schedules a synthetic campaign, enforces a configured concurrency cap, persists every actual attempt, retries retryable outcomes with backoff, and computes analytics from durable records. The design is intentionally narrow and local: it demonstrates orchestration correctness, deduplication, retry semantics, and analytics in a way that is easy to reason about and validate.
 
-This project implements a lightweight outbound voice campaign dispatcher in Python using asyncio and SQLite. It generates a synthetic contact list, applies a configurable concurrency cap, dispatches mock outbound calls, records every attempt in a local database, retries only retryable outcomes with exponential backoff, and summarizes the final campaign using persisted analytics.
+## What this demonstrates
 
-## 3. Key Features
+- bounded concurrency
+- concurrent idempotency
+- controlled retries
+- durable attempt records
+- campaign analytics
+- deterministic testing
 
-- Async outbound call orchestration
-- Configurable concurrency
-- Idempotent dispatch
-- Retry and exponential backoff
-- SQLite persistence
-- Call attempt tracking
-- Campaign analytics
-- Synthetic/mock telephony provider
-- Automated tests
-
-## 4. Architecture
+## Architecture
 
 ```mermaid
 flowchart TD
     A[Campaign Driver] --> B[Campaign Dispatcher]
     B --> C[Concurrency Control]
-    C --> D[Idempotency]
+    C --> D[Idempotency Check / Claim]
     D --> E[Mock Telephony Provider]
     E --> F[Retry / Backoff]
-    F --> G[SQLite]
+    F --> G[Attempt Persistence]
     G --> H[Analytics]
 ```
 
-The actual implementation is organized around a CLI entrypoint, a bounded async worker pool, a per-attempt SQLite reservation, a synthetic provider, and analytics derived from stored attempt data.
+The runtime flow is straightforward:
 
-## 5. How It Works
+1. The CLI builds a synthetic contact cohort.
+2. The dispatcher places each contact into an async queue.
+3. A bounded number of workers pull jobs from the queue.
+4. Before dispatching, the code reserves the per-attempt record to ensure idempotency.
+5. The mock telephony layer returns a synthetic disposition and latency.
+6. The result is written to SQLite.
+7. Retryable states are retried with backoff.
+8. Analytics are calculated from the persisted attempt rows.
 
-1. Generate or load contacts.
-   The CLI creates a synthetic cohort of contacts with a campaign identifier, contact identifier, phone number, and payload metadata.
+## Core Guarantees
 
-2. Start the campaign.
-   A queue is created for each contact job, and the dispatcher begins processing them with a bounded number of async workers.
+| Guarantee | Implementation | What it ensures |
+|---|---|---|
+| Concurrency | `max_in_flight` workers + `asyncio.Queue` | No more than the configured number of provider calls are active at once |
+| Idempotency | unique `(campaign_id, contact_id, attempt_no)` reservation in SQLite | Duplicate requests for the same logical attempt do not create duplicate provider calls |
+| Retry | `should_retry()` with `next_backoff_delay()` | Only `no_answer` and `failed` outcomes are retried |
+| Persistence | `call_attempts` table writes | Every actual provider attempt is stored with disposition, timestamp, and latency |
+| Analytics | `compute_analytics()` over persisted rows | Metrics are derived from recorded data rather than transient in-memory state |
 
-3. Apply the concurrency limit.
-   The worker count is set to the configured `--concurrency` value, so the number of active provider calls is capped by the dispatcher rather than allowed to grow unbounded.
+## Dispatch Lifecycle
 
-4. Check idempotency.
-   Before a provider call is executed, the system attempts to reserve a row for the logical key `(campaign_id, contact_id, attempt_no)`. This is enforced by a unique constraint in SQLite.
+```mermaid
+flowchart LR
+    A[Contact] --> B[Dispatch eligibility]
+    B --> C[Idempotency protection]
+    C --> D[Concurrency slot acquired]
+    D --> E[Provider call]
+    E --> F[Persist attempt]
+    F --> G{Retryable?}
+    G -- Yes --> H[Backoff + next attempt]
+    G -- No --> I[Terminal state]
+```
 
-5. Dispatch a mock call.
-   If the reservation succeeds, the mock provider returns a synthetic disposition and latency.
+The dispatcher uses a queue-driven worker model: jobs are queued first, then only a limited number of workers are allowed to call the provider at once. A reservation is written before the dispatch executes so a duplicate request can immediately detect that the logical attempt has already been claimed.
 
-6. Record the attempt.
-   The dispatcher updates the same database row to mark the attempt as `completed` and stores the disposition, timestamp, and latency in milliseconds.
+## Concurrency
 
-7. Retry eligible failures.
-   For `no_answer` and `failed`, the dispatcher schedules a retry if the current attempt number is below the configured maximum. The retry delay is computed with exponential backoff and jitter.
+The project enforces a configurable concurrency cap via the CLI flag `--concurrency` and the `CampaignDispatcher(max_in_flight=...)` setting.
 
-8. Calculate analytics.
-   After the queue drains, the analytics module reads the stored attempts and computes connection rate, disposition breakdowns, average attempts, and average time-to-first-connect.
+For example, with `--concurrency 10`:
 
-## 6. Tech Stack
+- at most 10 provider calls may be active at the same time
+- additional contacts remain queued until a worker slot is available
+- `asyncio` is used to coordinate the worker pool without introducing external infrastructure
 
-- Python
-- asyncio
-- SQLite
-- pytest
+This is a local in-process concurrency model rather than a distributed rate limiter. The implementation prevents excess provider calls by combining the bounded worker pool with the reserve-before-dispatch check.
 
-## 7. Project Structure
+## Idempotency
+
+The idempotency boundary is the logical attempt key:
+
+- `campaign_id`
+- `contact_id`
+- `attempt_no`
+
+The SQLite schema enforces uniqueness on `(campaign_id, contact_id, attempt_no)`. Before calling the provider, the dispatcher calls `reserve_attempt()`, which inserts a row with `status = 'reserved'`. If the same logical attempt is processed a second time concurrently, SQLite raises an integrity error and the duplicate work exits without invoking the provider again.
+
+```text
+Request A ──────┐
+                ├── contact X / attempt 1
+Request B ──────┘
+
+Result: one provider call, one persisted attempt row
+```
+
+This prevents duplicate real provider dispatches for the same logical contact/attempt pair while keeping the implementation local and deterministic.
+
+## Retry Strategy
+
+The retry decision is driven by `should_retry(disposition)`.
+
+| Outcome | Retry? | Behavior |
+|---|---|---|
+| answered | No | Mark complete; stop retrying |
+| no_answer | Yes | Retry if attempt count has not reached the configured max |
+| voicemail | No | Mark complete; stop retrying |
+| busy | No | Mark complete; stop retrying |
+| failed | Yes | Retry if attempt count has not reached the configured max |
+
+Retry timing is computed by `next_backoff_delay()`, which uses an exponential schedule with jitter. The implementation starts from `initial_delay`, multiplies by `multiplier ** (attempt_no - 1)`, caps the delay at `max_delay`, and adds a bounded random variation around that value.
+
+## Data Model
+
+The primary persisted records are campaigns, contacts, and call attempts.
+
+| Field | Purpose |
+|---|---|
+| `campaign_id` | identifies the campaign |
+| `contact_id` | identifies the contact within the campaign |
+| `attempt_no` | sequential retry number for that contact |
+| `attempt_ts` | timestamp recorded for the attempt |
+| `disposition` | terminal outcome such as answered, no_answer, voicemail, busy, failed |
+| `latency_ms` | simulated provider latency for the call |
+| `status` | `reserved` before completion, `completed` after completion |
+
+The `call_attempts` table is the source of truth for retries and analytics. The schema also enforces uniqueness for `(campaign_id, contact_id, attempt_no)` so duplicate requests cannot create duplicate attempts.
+
+## Analytics
+
+Analytics are computed from the persisted attempt rows in `app/analytics.py`.
+
+1. Connection rate
+   - definition: answered unique contacts / total unique contacts
+   - denominator: unique contacts dispatched in the campaign
+   - this is not attempts; it is contact-level success rate
+
+2. Disposition breakdown
+   - counts each outcome across all stored attempts
+   - `answered`, `no_answer`, `voicemail`, `busy`, and `failed` are tracked as recorded disposition values
+
+3. Average attempts before terminal state
+   - computed as the mean terminal attempt number across contacts
+   - reflects the last attempt recorded for each contact
+
+4. Average time-to-first-connect
+   - for contacts that reached `answered`, this measures the delta between a contact’s first dispatch timestamp and the first successful answered timestamp
+   - it is computed from persisted timestamps, not from in-memory counters
+
+## Project Structure
 
 ```text
 .
@@ -84,26 +164,22 @@ The actual implementation is organized around a CLI entrypoint, a bounded async 
 │   └── run_campaign.py
 ├── tests/
 │   └── test_dispatcher.py
-├── debug_analytics.py
-├── debug_compute.py
-├── debug_run_campaign.py
+├── .gitignore
 ├── pytest.ini
 ├── README.md
-├── campaign.db
-├── campaign_final.db
-├── debug_analytics.db
-├── out/
-├── .venv/
-├── .git/
-├── .pytest_cache/
-└── .gitignore
+└── .git/
 ```
 
-This is the current repository layout in the workspace. The runtime logic is concentrated in the `app` package and the CLI driver in `scripts/run_campaign.py`.
+The real application logic lives under `app`, with the CLI entrypoint in `scripts/run_campaign.py` and the behavioral tests in `tests/test_dispatcher.py`.
 
-## 8. Setup
+## Quick Start
 
-This repository does not include a `requirements.txt` file. The project uses the Python standard library and `pytest` for its automated tests.
+### Prerequisites
+
+- Python 3.11+
+- `pytest` for running the suite
+
+### Installation
 
 ```bash
 git clone <repository-url>
@@ -132,31 +208,29 @@ Install the test dependency:
 pip install pytest
 ```
 
-## 9. Running the Project
-
-The supported CLI entrypoint is:
+### Run a demo campaign
 
 ```bash
 python scripts/run_campaign.py --contacts 300 --concurrency 10 --max-attempts 4 --seed 42
 ```
 
-Optional export to JSON or CSV:
+Optional export:
 
 ```bash
 python scripts/run_campaign.py --contacts 300 --concurrency 10 --max-attempts 4 --seed 42 --output out/campaign.json
 ```
 
-The script accepts:
+The CLI supports these configuration flags:
 
 - `--contacts`: number of synthetic contacts
-- `--concurrency`: maximum concurrent provider calls in flight
-- `--max-attempts`: maximum retry attempts per contact
-- `--seed`: optional fixed random seed for deterministic runs
-- `--output`: optional JSON or CSV export path
+- `--concurrency`: maximum concurrent provider calls
+- `--max-attempts`: max retry attempts per contact
+- `--seed`: optional deterministic random seed
+- `--output`: optional JSON or CSV export target
 
-## 10. Example Output
+## Example Output
 
-Example output from the repository’s synthetic demo data (labeled as example/simulated output):
+Example output from the repository’s demo data:
 
 ```text
 Campaign: cmp_final
@@ -190,130 +264,27 @@ Analytics:
 }
 ```
 
-This output is based on the actual persisted analytics from the current demo database and is not a performance benchmark.
+This is representative of the actual persisted analytics in the repository’s demo flow and is meant to illustrate the behavior of the implementation, not to advertise benchmark claims.
 
-## 11. Configuration
+## Testing
 
-The implemented configuration points are:
-
-- `--contacts`: contact count for the generated campaign
-- `--concurrency`: maximum number of active provider calls at one time
-- `--max-attempts`: maximum retry attempts per contact
-- `--seed`: optional seed for deterministic random behavior
-- `--output`: optional export target
-
-The mock provider uses the following defaults:
-
-- `min_delay_seconds = 0.1`
-- `max_delay_seconds = 2.0`
-- probability distribution: answered 45%, no_answer 30%, voicemail 12%, busy 8%, failed 5%
-
-The retry policy defaults are:
-
-- `max_attempts = 4`
-- `initial_delay = 2.0`
-- `multiplier = 2.0`
-- `max_delay = 30.0`
-- `jitter_ratio = 0.2`
-
-## 12. Concurrency Design
-
-The dispatcher creates a bounded number of async workers and feeds them from an `asyncio.Queue`. Jobs remain queued until a worker becomes available, so the number of active provider calls never exceeds the configured concurrency cap.
-
-When the limit is reached, extra jobs wait in the queue rather than invoking the provider. `asyncio` is used to coordinate multiple in-flight tasks efficiently without requiring a full multi-process worker model.
-
-The implementation prevents more than `N` provider calls by combining the queue-based worker cap with an attempt reservation check before each provider dispatch.
-
-## 13. Idempotency Design
-
-The logical dispatch key is the tuple `(campaign_id, contact_id, attempt_no)`. This combination is unique in the `call_attempts` table and is used as the real idempotency boundary.
-
-Before the provider call executes, the dispatcher calls `reserve_attempt`, which inserts a row with `status = 'reserved'`. If a duplicate concurrent request reaches the same key, SQLite raises an integrity error and the duplicate request exits without invoking the provider again.
-
-This ensures that only one actual provider call occurs for a given campaign/contact/attempt combination, while later duplicate requests are safely ignored.
-
-## 14. Retry Strategy
-
-The retry decision is driven by `should_retry(disposition)`.
-
-| Disposition | Action |
-|---|---|
-| answered | Mark completed; do not retry |
-| no_answer | Mark completed; retry if attempt number is below the configured maximum |
-| voicemail | Mark completed; do not retry |
-| busy | Mark completed; do not retry |
-| failed | Mark completed; retry if attempt number is below the configured maximum |
-
-Retry backoff is calculated by `next_backoff_delay`, which starts from `initial_delay`, multiplies by `multiplier ** (attempt_no - 1)`, caps the result at `max_delay`, and adds a small randomized jitter around the computed value.
-
-## 15. Persistence
-
-Every actual provider call is recorded in SQLite in the `call_attempts` table. The persisted fields include:
-
-- `campaign_id`
-- `contact_id`
-- `attempt_no`
-- `status` (`reserved` or `completed`)
-- `disposition`
-- `attempt_ts`
-- `latency_ms`
-- `attempt_id` and `created_at` generated by SQLite
-
-The contact and campaign records live in separate tables, and the attempt table is the source of truth for retries and analytics.
-
-## 16. Analytics
-
-The analytics module computes the following metrics from persisted call-attempt rows:
-
-- `connection_rate`: number of contacts with at least one `answered` disposition divided by total unique contacts
-- `disposition_counts`: count of each outcome across all attempts
-- `disposition_percentages`: percentage of each outcome across all attempts
-- `avg_attempts_before_terminal`: mean terminal attempt number per contact
-- `avg_time_to_first_connect_seconds`: average time from a contact’s first dispatch to its first answered disposition
-
-These values are derived from the stored database state rather than from transient in-memory counters.
-
-## 17. Testing
-
-The repository includes automated tests in `tests/test_dispatcher.py` and the exact command is:
+The automated suite is in `tests/test_dispatcher.py` and is run with:
 
 ```bash
 python -m pytest -q
 ```
 
-The test suite covers:
+The tests cover:
 
 - concurrency limits
-- idempotency for repeated or concurrent requests
-- retry flows for `no_answer` and `failed`
-- persistence of every actual attempt
+- duplicate and concurrent dispatch idempotency
+- retry behavior for `no_answer` and `failed`
+- persistence of actual provider attempts
 - analytics correctness
-- edge cases such as empty cohorts, single-contact runs, and max-attempt exhaustion
+- edge cases such as empty cohorts and max-attempt exhaustion
 
-Current validation: 15 tests passed in 19.62s.
+The repository currently validates successfully with 15 passing tests.
 
-## 18. Design Decisions & Trade-offs
+## Scope and Boundaries
 
-The implementation keeps a narrow and practical scope:
-
-- `asyncio` is used to coordinate a small number of worker tasks without introducing a heavier queueing system.
-- The concurrency mechanism is a fixed-size async queue with a reservation check before provider calls.
-- SQLite is chosen as the local durable store for idempotency and analytics.
-- Idempotency is enforced by a natural unique key rather than a distributed lock or external coordination layer.
-- Retry logic is intentionally simple and bounded, with backoff and jitter to reduce repeated call bursts.
-
-## 19. Production Considerations
-
-This is a take-home implementation, not a production dialer. The most relevant gaps are:
-
-- distributed idempotency for multi-process or multi-host execution
-- distributed concurrency or rate limiting across multiple workers
-- a durable job queue for crash-safe scheduling
-- recovery logic for stalled or interrupted `reserved` attempts
-- stronger observability and alerting around call outcomes and retries
-
-These are real engineering concerns for a larger telephony system, but they are outside the current repository scope.
-
-## 20. AI Assistance
-
-AI coding assistance was used during development of this repository. The implementation remains intentionally narrow and is consistent with the existing assignment requirements and the verified code in this workspace.
+This repository is a local, deterministic take-home implementation focused on orchestration correctness and data integrity. It intentionally does not model a distributed telephony platform or a production dialer. The emphasis is on exact behavior in a controlled environment: queueing, concurrency, deduplication, retries, persistence, and analytics on recorded attempts.
